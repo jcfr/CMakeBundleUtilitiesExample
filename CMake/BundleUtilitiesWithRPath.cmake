@@ -16,6 +16,7 @@
 #   get_bundle_keys
 #   copy_resolved_item_into_bundle
 #   copy_resolved_framework_into_bundle
+#   is_resolved_item_embedded
 #   fixup_bundle_item
 #   verify_bundle_prerequisites
 #   verify_bundle_symlinks
@@ -109,6 +110,13 @@
 # ON before calling fixup_bundle. By default,
 # COPY_RESOLVED_FRAMEWORK_INTO_BUNDLE copies the framework dylib itself plus
 # the framework Resources directory.
+#
+#  IS_RESOLVED_ITEM_EMBEDDED(<resolved_item> <exepath> <verbose> <is_embedded_var>)
+# Set variable <is_embedded_var> to True if the resolved item is
+# embedded into the bundle. The function does NOT check for the existence of the
+# item, instead if checks if the provided path would correspond to an embeddable
+# item. If <verbose> is True, extra information will be displayed in case the item
+# is not embedded.
 #
 #  FIXUP_BUNDLE_ITEM(<resolved_embedded_item> <exepath> <dirs>)
 # Get the direct/non-system prerequisites of the resolved embedded item. For
@@ -350,6 +358,7 @@ function(clear_bundle_keys keys_var)
   set(${keys_var} PARENT_SCOPE)
 endfunction()
 
+
 function(set_bundle_key_values keys_var context item exepath dirs copyflag)
   get_filename_component(item_name "${item}" NAME)
 
@@ -374,22 +383,52 @@ function(set_bundle_key_values keys_var context item exepath dirs copyflag)
       # embedded path:
       #
       set(embedded_item "${default_embedded_path}/${item_name}")
+
+      if(APPLE)
+        # For executables inside the bundle, extract the expected path.
+        # This remove the hack introduced in commit 6f8bdd27 consisting in
+        # reseting the value of 'resolved_embedded_item' with 'resolved_item'.
+        get_dotapp_dir("${exepath}" exe_dotapp_dir)
+        if(NOT DEFINED gp_bundle_executables)
+          get_bundle_all_executables("${exe_dotapp_dir}" gp_bundle_executables)
+        endif()
+        foreach(exe ${gp_bundle_executables})
+          get_item_key("${exe}" exe_key)
+          list(APPEND exe_keys ${exe_key})
+        endforeach()
+        list(FIND exe_keys ${key} is_executable)
+        if(NOT is_executable EQUAL "-1")
+          get_filename_component(resolved_item_path ${resolved_item} PATH)
+          file(RELATIVE_PATH exe_relative_path_from_dir ${exe_dotapp_dir} ${resolved_item_path})
+          # For example, if input variables are:
+          #   resolved_item:       /path/to/MyApp.app/Contents/bin/myapp
+          #   exe_dotapp_dir:      /path/to/MyApp.app
+          # Computed variables will be:
+          #   resolved_item_path:         /path/to/MyApp.app/Contents/bin
+          #   exe_relative_path_from_dir: Contents/bin
+          set(embedded_item "@executable_path/../../${exe_relative_path_from_dir}/${item_name}")
+          set(show_status 0)
+          if(show_status)
+            message(STATUS "resolved_item='${resolved_item}'")
+            message(STATUS "exe_dotapp_dir='${exe_dotapp_dir}'")
+            message(STATUS "exe_relative_path_from_dir='${exe_relative_path_from_dir}'")
+            message(STATUS "item_name='${item_name}'")
+            message(STATUS "embedded_item='${embedded_item}'")
+            message(STATUS "")
+          endif()
+        endif()
+      endif()
     endif()
 
-    # Replace @executable_path and resolve ".." references:
-    #
-    string(REPLACE "@executable_path" "${exepath}" resolved_embedded_item "${embedded_item}")
+    gp_resolve_embedded_item("${context}" "${embedded_item}" "${exepath}" resolved_embedded_item)
     get_filename_component(resolved_embedded_item "${resolved_embedded_item}" ABSOLUTE)
 
-    # *But* -- if we are not copying, then force resolved_embedded_item to be
-    # the same as resolved_item. In the case of multiple executables in the
-    # original bundle, using the default_embedded_path results in looking for
-    # the resolved executable next to the main bundle executable. This is here
-    # so that exes in the other sibling directories (like "bin") get fixed up
-    # properly...
-    #
-    if(NOT copyflag)
-      set(resolved_embedded_item "${resolved_item}")
+    # Do not copy already embedded item
+    set(verbose 0)
+    is_resolved_item_embedded("${resolved_embedded_item}" "${exepath}" "${verbose}" is_embedded)
+    if(EXISTS "${resolved_embedded_item}" AND is_embedded)
+      set(copyflag 0)
+      set(resolved_item "${resolved_embedded_item}")
     endif()
 
     set(${keys_var} ${${keys_var}} PARENT_SCOPE)
@@ -417,7 +456,7 @@ function(get_bundle_keys app libs dirs keys_var)
 
     # But do fixups on all executables in the bundle:
     #
-    get_bundle_all_executables("${bundle}" exes)
+    get_bundle_all_executables("${bundle}" gp_bundle_executables)
 
     # For each extra lib, accumulate a key as well and then also accumulate
     # any of its prerequisites. (Extra libs are typically dynamically loaded
@@ -438,7 +477,7 @@ function(get_bundle_keys app libs dirs keys_var)
     # The list of keys should be complete when all prerequisites of all
     # binaries in the bundle have been analyzed.
     #
-    foreach(exe ${exes})
+    foreach(exe ${gp_bundle_executables})
       # Add the exe itself to the keys:
       #
       set_bundle_key_values(${keys_var} "${exe}" "${exe}" "${exepath}" "${dirs}" 0)
@@ -531,6 +570,29 @@ function(copy_resolved_framework_into_bundle resolved_item resolved_embedded_ite
 
 endfunction()
 
+function(is_resolved_item_embedded resolved_item exepath verbose is_embedded_var)
+  get_dotapp_dir("${exepath}" exe_dotapp_dir)
+  string(LENGTH "${exe_dotapp_dir}/" exe_dotapp_dir_length)
+  string(LENGTH "${resolved_item}" resolved_item_length)
+  set(path_too_short 0)
+  set(is_embedded 0)
+  if(${resolved_item_length} LESS ${exe_dotapp_dir_length})
+    set(path_too_short 1)
+  endif()
+  if(NOT path_too_short)
+    string(SUBSTRING "${resolved_item}" 0 ${exe_dotapp_dir_length} item_substring)
+    if("${exe_dotapp_dir}/" STREQUAL "${item_substring}")
+      set(is_embedded 1)
+    endif()
+  endif()
+  if(verbose AND NOT is_embedded)
+    message("  exe_dotapp_dir/='${exe_dotapp_dir}/'")
+    message("  item_substring='${item_substring}'")
+    message("  resolved_item='${resolved_item}'")
+    message("")
+  endif()
+  set(${is_embedded_var} ${is_embedded} PARENT_SCOPE)
+endfunction()
 
 function(fixup_bundle_item resolved_embedded_item exepath dirs)
   # This item's key is "ikey":
@@ -542,25 +604,9 @@ function(fixup_bundle_item resolved_embedded_item exepath dirs)
   # tree, or in other varied locations around the file system, with our call to
   # install_name_tool. Make sure that doesn't happen here:
   #
-  get_dotapp_dir("${exepath}" exe_dotapp_dir)
-  string(LENGTH "${exe_dotapp_dir}/" exe_dotapp_dir_length)
-  string(LENGTH "${resolved_embedded_item}" resolved_embedded_item_length)
-  set(path_too_short 0)
-  set(is_embedded 0)
-  if(${resolved_embedded_item_length} LESS ${exe_dotapp_dir_length})
-    set(path_too_short 1)
-  endif()
-  if(NOT path_too_short)
-    string(SUBSTRING "${resolved_embedded_item}" 0 ${exe_dotapp_dir_length} item_substring)
-    if("${exe_dotapp_dir}/" STREQUAL "${item_substring}")
-      set(is_embedded 1)
-    endif()
-  endif()
+  set(verbose 1)
+  is_resolved_item_embedded("${resolved_embedded_item}" "${exepath}" "${verbose}" is_embedded)
   if(NOT is_embedded)
-    message("  exe_dotapp_dir/='${exe_dotapp_dir}/'")
-    message("  item_substring='${item_substring}'")
-    message("  resolved_embedded_item='${resolved_embedded_item}'")
-    message("")
     message("Install or copy the item into the bundle before calling fixup_bundle.")
     message("Or maybe there's a typo or incorrect path in one of the args to fixup_bundle?")
     message("")
@@ -604,8 +650,16 @@ function(fixup_bundle app libs dirs)
   message(STATUS "  dirs='${dirs}'")
 
   get_bundle_and_executable("${app}" bundle executable valid)
+  message(STATUS "  bundle='${bundle}'")
+  message(STATUS "  executable='${executable}'")
   if(valid)
     get_filename_component(exepath "${executable}" PATH)
+
+    # TODO: Extract list of rpath dirs automatically. On MacOSX, the following could be
+    #       done: otool -l path/to/executable | grep -A 3 LC_RPATH | grep path
+    #       See http://www.mikeash.com/pyblog/friday-qa-2009-11-06-linking-and-install-names.html#comment-87ea054b4839586412727dcfc94c79d2
+    set(GP_RPATH_DIR ${bundle}/Contents)
+    message(STATUS "  GP_RPATH_DIR='${GP_RPATH_DIR}'")
 
     message(STATUS "fixup_bundle: preparing...")
     get_bundle_keys("${app}" "${libs}" "${dirs}" keys)
